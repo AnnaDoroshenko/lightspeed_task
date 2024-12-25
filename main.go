@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"math/bits"
@@ -20,29 +19,17 @@ const (
 func main() {
 	start := time.Now()
 
-	ipAddrs := make([]uint64, 1<<26)
-
 	ipProcessor, err := newIpProcessor(file)
 	if err != nil {
 		panic(err)
 	}
 	defer ipProcessor.Close()
 
-	for {
-		ipAddr, exists := ipProcessor.next()
-		if !exists {
-			break
-		}
-		subAddr := ipAddr & 63
-		mainAddr := ipAddr >> 6
-		ipAddrs[mainAddr] |= 1 << subAddr
+	count, err := ipProcessor.CountUnique()
+	if err != nil {
+		panic(err)
 	}
 
-	count := 0
-
-	for _, v := range ipAddrs {
-		count += bits.OnesCount64(v)
-	}
 	fmt.Printf("Result: %d unique addresses\n", count)
 
 	elapsed := time.Since(start)
@@ -51,11 +38,8 @@ func main() {
 
 type ipProcessor struct {
 	FileHandler *os.File
-	Reader      *bufio.Reader
 	Buf         []byte
-	BufIndex    int
-	BufLen      int
-	Finished    bool
+	IpAddrs     []uint64
 }
 
 func newIpProcessor(file string) (*ipProcessor, error) {
@@ -64,16 +48,13 @@ func newIpProcessor(file string) (*ipProcessor, error) {
 		return nil, err
 	}
 
-	reader := bufio.NewReader(f)
 	buf := make([]byte, chunkSize)
+	ipAddrs := make([]uint64, 1<<26)
 
 	return &ipProcessor{
 		FileHandler: f,
-		Reader:      reader,
 		Buf:         buf,
-		BufIndex:    0,
-		BufLen:      0,
-		Finished:    false,
+		IpAddrs:     ipAddrs,
 	}, nil
 }
 
@@ -81,69 +62,70 @@ func (ipProcessor *ipProcessor) Close() {
 	ipProcessor.FileHandler.Close()
 }
 
-func (ipProcessor *ipProcessor) next() (uint32, bool) {
-	if ipProcessor.Finished {
-		return 0, false
-	}
-
-	tmp := make([]byte, maxIpLen)
-	tmpLen := 0
-
+func (ipProcessor *ipProcessor) CountUnique() (int, error) {
+	start := 0
 	for {
-		if ipProcessor.BufIndex == ipProcessor.BufLen {
-			var err error
-			ipProcessor.BufLen, err = ipProcessor.Reader.Read(ipProcessor.Buf)
-			ipProcessor.BufIndex = 0
-			if err != nil {
-				if err == io.EOF {
-					ipProcessor.Finished = true
-					if tmpLen > 0 {
-						break // need to process the last IP
-					}
-				}
-				return 0, false
+		bytesRead, err := ipProcessor.FileHandler.Read(ipProcessor.Buf[start:])
+		if err != nil {
+			if err == io.EOF {
+				break
 			}
+			return 0, err
 		}
-		cur := ipProcessor.Buf[ipProcessor.BufIndex]
-		ipProcessor.BufIndex++
-		if cur == lfCharCode {
+
+		length := start + bytesRead
+		if length == 0 {
 			break
 		}
-		tmp[tmpLen] = cur
-		tmpLen++
-	}
 
-	return readIpAddr(tmp, tmpLen)
-}
-
-func readBlock(buf []byte, index int, bufLen int) (int, uint8, bool) {
-	var block uint8 = 0
-	readCount := 0
-
-	for {
-		readCount++
-		if index == bufLen || buf[index] == dotCharCode {
-			return readCount, block, true
+		end := length - 1
+		for ipProcessor.Buf[end] != lfCharCode {
+			end--
 		}
-		block = block*10 + uint8(buf[index]-'0')
-		index++
+		end++ // first after delimiter
+
+		start = 0
+		for start != end {
+			addr := ipProcessor.parseAddr(&start)
+			ipProcessor.remember(&addr)
+		}
+
+		for start = 0; start+end < length; start++ {
+			ipProcessor.Buf[start] = ipProcessor.Buf[start+end]
+		}
 	}
+
+	count := ipProcessor.onesCount()
+
+	return count, nil
 }
 
-func readIpAddr(buf []byte, bufLen int) (uint32, bool) {
+func (ipProcessor *ipProcessor) parseAddr(it *int) uint32 {
 	var ipAddr uint32 = 0
-	var offset uint32 = 24 // 3 bytes
-
-	for index := 0; index < bufLen; {
-		readCount, block, ok := readBlock(buf, index, bufLen)
-		if !ok {
-			return 0, false
+	for i := 0; i < 4; i++ {
+		var block uint32 = 0
+		for '0' <= ipProcessor.Buf[*it] && ipProcessor.Buf[*it] <= '9' {
+			block = block*10 + uint32(ipProcessor.Buf[(*it)]-'0')
+			(*it)++
 		}
-
-		ipAddr |= uint32(block) << offset
-		offset -= 8
-		index += readCount
+		(*it)++
+		ipAddr = (ipAddr << 8) | block
 	}
 
-	return ipAddr, true
+	return ipAddr
+}
+
+func (ipProcessor *ipProcessor) remember(addr *uint32) {
+	subAddr := *addr & 63
+	mainAddr := *addr >> 6
+	ipProcessor.IpAddrs[mainAddr] |= 1 << subAddr
+}
+
+func (ipProcessor *ipProcessor) onesCount() int {
+	count := 0
+	for _, v := range ipProcessor.IpAddrs {
+		count += bits.OnesCount64(v)
+	}
+
+	return count
 }
