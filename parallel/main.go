@@ -2,44 +2,47 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"math/bits"
 	"os"
-	"runtime"
 	"sync"
 	"time"
 )
 
 const (
-	file        = "ip_addresses"
-	chunkSize   = 1024 * 8
-	lfCharCode  = 10
-	maxIpLen    = 15
-	workerCount = 8
-	bufSize     = workerCount
+	file          = "ip_addresses"
+	chunkSize     = 1024 * 8
+	lfCharCode    = 10
+	maxIpLen      = 15
+	minIpLen      = 7
+	addrChunkSize = chunkSize / minIpLen
+	workerCount   = 4
 )
 
 func main() {
-	runtime.GOMAXPROCS(workerCount)
-
 	start := time.Now()
 
 	ipAddrs := make([]uint64, 1<<26)
-	chunks := make(chan []byte, bufSize)
-	addrs := make(chan uint32, bufSize)
+	addrs := make(chan Result)
+	honks := make(chan int, workerCount)
 	var wg sync.WaitGroup
+	workerPool := [workerCount]Worker{}
 
-	// Fan-out: Start workers
+	// Create and start workers
 	for w := 0; w < workerCount; w++ {
 		wg.Add(1)
-		go worker(chunks, addrs, &wg)
+		worker := NewWorker(w)
+		workerPool[w] = *worker
+		go worker.Run(addrs, &wg)
+		honks <- w
 	}
 
-	// Send chunks to the chunks channel
 	go func() {
-		defer close(chunks)
+		defer close(honks)
+		for i := 0; i < workerCount; i++ {
+			defer workerPool[i].Close()
+		}
 
 		f, err := os.Open(file)
 		if err != nil {
@@ -48,10 +51,18 @@ func main() {
 		defer f.Close()
 
 		reader := bufio.NewReader(f)
-		buf := make([]byte, chunkSize)
-		lastTerminator := 0
-		for {
-			bytesRead, err := reader.Read(buf[lastTerminator:])
+		start := 0
+		remainder := make([]byte, chunkSize)
+		// Wait until a worker is ready for a new chunk to work on
+		for id := range honks {
+			if start != 0 {
+				for i := 0; i < start; i++ {
+					workerPool[id].Buf[i] = remainder[i] // Copy the remainder
+				}
+			}
+
+			// Read a new chunk from file directly into the worker's buffer
+			bytesRead, err := reader.Read(workerPool[id].Buf[start:])
 			if err != nil {
 				if err == io.EOF {
 					break
@@ -59,31 +70,39 @@ func main() {
 				panic(err)
 			}
 
-			bufLen := lastTerminator + bytesRead
-			lastTerminator = bytes.LastIndexByte(buf[:bufLen], lfCharCode)
-
-			bufCopy := make([]byte, len(buf[:lastTerminator+1]))
-			copy(bufCopy, buf[:lastTerminator+1])
-			chunks <- bufCopy
-
-			remainingLen := bufLen - lastTerminator - 1
-			for i := 0; i < remainingLen; i++ {
-				buf[i] = buf[i+lastTerminator+1]
+			// Find the last newline to make sure the worker always finishes on a valid IP addr end
+			length := start + bytesRead
+			end := length - 1
+			for workerPool[id].Buf[end] != lfCharCode {
+				end--
 			}
-			lastTerminator = remainingLen
+			end++ // First after the delimiter
+
+			// Signal the worker that a new chunk has been read to its buffer
+			workerPool[id].Ends <- end
+
+			// Store the remainder for the next worker
+			for start = 0; start+end < length; start++ {
+				remainder[start] = workerPool[id].Buf[start+end]
+			}
 		}
 	}()
 
-	// Fan-in: Close addrs channel once all workers complete
 	go func() {
 		wg.Wait()
 		close(addrs)
 	}()
 
-	for addr := range addrs {
-		subAddr := addr & 63
-		mainAddr := addr >> 6
-		ipAddrs[mainAddr] |= 1 << subAddr
+	// Wait until workers are done processing their chunks
+	for result := range addrs {
+		for i := 0; i < result.index; i++ {
+			addr := workerPool[result.id].Result[i]
+			subAddr := addr & 63
+			mainAddr := addr >> 6
+			ipAddrs[mainAddr] |= 1 << subAddr
+		}
+		// Signal that the result has been processed and the worker is ready to start the next chunk
+		honks <- result.id
 	}
 
 	count := 0
@@ -96,58 +115,62 @@ func main() {
 	fmt.Printf("Counting unique addresses took %s\n", elapsed)
 }
 
-// Worker processes chunks and sends results to the addrs channel
-func worker(chunks <-chan []byte, addrs chan<- uint32, wg *sync.WaitGroup) {
+type Result struct {
+	id    int
+	index int
+}
+
+type Worker struct {
+	Id     int
+	Buf    []byte
+	Ends   chan int
+	Result []uint32
+}
+
+func NewWorker(id int) *Worker {
+	buf := make([]byte, chunkSize)
+	ends := make(chan int)
+	result := make([]uint32, addrChunkSize)
+
+	return &Worker{
+		Id:     id,
+		Buf:    buf,
+		Ends:   ends,
+		Result: result,
+	}
+}
+
+func (worker *Worker) Close() {
+	close(worker.Ends)
+}
+
+func (worker *Worker) Run(addrs chan<- Result, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	tmp := make([]byte, maxIpLen)
-	tmpLen := 0
-	for chunk := range chunks {
-		for _, char := range chunk {
-			if char == lfCharCode || len(tmp) == tmpLen {
-				curAddr, ok := readIpAddr(tmp, tmpLen)
-				if !ok {
-					return
-				}
-				addrs <- curAddr
-				tmpLen = 0
-			} else {
-				tmp[tmpLen] = char
-				tmpLen++
-			}
+	// Wait until a new chunk has been read into the worker's buffer
+	for end := range worker.Ends {
+		start := 0
+		resultIndex := 0
+		for ; start != end; resultIndex++ {
+			addr := worker.parseAddr(&start)
+			worker.Result[resultIndex] = addr
 		}
+		// Signal that addresses from current chunk are ready
+		addrs <- Result{worker.Id, resultIndex}
 	}
 }
 
-func readBlock(buf []byte, index int, bufLen int) (int, uint8, bool) {
-	const dotCharCode = 46
-
-	var block uint8 = 0
-	readCount := 0
-	for {
-		readCount++
-		if index == bufLen || buf[index] == dotCharCode {
-			return readCount, block, true
-		}
-		block = block*10 + uint8(buf[index]-'0')
-		index++
-	}
-}
-
-func readIpAddr(buf []byte, bufLen int) (uint32, bool) {
+func (worker *Worker) parseAddr(it *int) uint32 {
 	var ipAddr uint32 = 0
-	var offset uint32 = 24 // 3 bytes
-
-	for index := 0; index < bufLen; {
-		readCount, block, ok := readBlock(buf, index, bufLen)
-		if !ok {
-			return 0, false
+	for i := 0; i < 4; i++ {
+		var block uint32 = 0
+		for '0' <= worker.Buf[*it] && worker.Buf[*it] <= '9' {
+			block = block*10 + uint32(worker.Buf[(*it)]-'0')
+			(*it)++
 		}
-
-		ipAddr |= uint32(block) << offset
-		offset -= 8
-		index += readCount
+		(*it)++
+		ipAddr = (ipAddr << 8) | block
 	}
 
-	return ipAddr, true
+	return ipAddr
 }

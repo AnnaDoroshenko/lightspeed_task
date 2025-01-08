@@ -21,4 +21,4 @@ This approach is superior because the theoretical minimum amount of memory is us
 
 ### Quick description of #3
 A fan-out fan-in pattern with goroutines and channels was used, where chunks of the input file are spread into multiple workers, each parsing IP addresses and sending them into the output channel, which collects them and inserts them into the array in approach #2.
-Due to the high overhead of memory management with multiple workers and the simple nature of the quant of work, this approach was slower than the straight-up approach #2.
+This multi-threaded approach was faster than the straight-up approach #2 because file chunks were processed concurrently. Also, we consume less memory and avoid excessive memory copying by reading from the file directly into the workers' buffers and reusing the result buffers.
